@@ -3,6 +3,7 @@
 POST /plans                              提交器物与容量，求解、保存并返回方案
 GET  /plans/{plan_id}                    按 ID 读取已保存方案
 POST /plans/{plan_id}/capacity-target    求使最少窑次不超过目标的最小单窑容量
+POST /plans/{plan_id}/production-limit   限窑次接单：在最多 max_kilns 窑内择优保留器物
 GET  /health                             健康检查
 """
 
@@ -22,12 +23,15 @@ from .schemas import (
     KilnOut,
     PlanCreate,
     PlanOut,
+    ProductionLimitIn,
+    ProductionLimitOut,
 )
 from .solver import (
     CapacityExceededError,
     TargetUnreachableError,
     Ware,
     min_capacity_for_target,
+    select_within_kiln_limit,
     solve,
 )
 
@@ -191,5 +195,73 @@ def capacity_target(plan_id: str, payload: CapacityTargetIn) -> CapacityTargetOu
                 firing_temp=k.firing_temp,
             )
             for idx, k in enumerate(kilns, start=1)
+        ],
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/production-limit",
+    response_model=ProductionLimitOut,
+    tags=["plans"],
+    responses={
+        400: {"model": ErrorOut, "description": "窑次上限超出范围"},
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="限窑次接单：在最多 max_kilns 窑内择优保留器物",
+)
+def production_limit(plan_id: str, payload: ProductionLimitIn) -> ProductionLimitOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    max_kilns = payload.max_kilns
+    if max_kilns > plan["item_count"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MAX_KILNS_OUT_OF_RANGE",
+                "message": (
+                    f"窑次上限 {max_kilns} 超出范围: "
+                    f"原方案共 {plan['item_count']} 件器物，"
+                    f"max_kilns 须在 1～{plan['item_count']} 之间"
+                ),
+            },
+        )
+
+    # 以原方案保存的单窑容量、器物体积与温度区间计算，不改写原方案。
+    wares = [
+        Ware(
+            item_id=it["item_id"],
+            volume=it["volume"],
+            temp_low=it["temp_low"],
+            temp_high=it["temp_high"],
+        )
+        for it in plan["items"]
+    ]
+    result = select_within_kiln_limit(wares, plan["capacity"], max_kilns)
+
+    return ProductionLimitOut(
+        plan_id=plan["id"],
+        max_kilns=max_kilns,
+        kept_count=len(result.kept_item_ids),
+        delayed_count=len(result.delayed_item_ids),
+        kept_volume=sum(k.total_volume for k in result.kilns),
+        kept_item_ids=list(result.kept_item_ids),
+        delayed_item_ids=list(result.delayed_item_ids),
+        kiln_count=len(result.kilns),
+        kilns=[
+            KilnOut(
+                index=idx,
+                item_ids=list(k.item_ids),
+                total_volume=k.total_volume,
+                firing_temp=k.firing_temp,
+            )
+            for idx, k in enumerate(result.kilns, start=1)
         ],
     )

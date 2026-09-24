@@ -14,6 +14,11 @@
   3. 贪心重建字典序最小方案：每一步在剩余器物中，找到包含剩余器物
      最小编号、且取出后剩余部分仍可在剩余窑次内装完的、
      器物编号序列字典序最小的子集作为下一窑。
+
+限窑次接单（select_within_kiln_limit）复用上述子集表与 dp：
+枚举全部子集，在 dp[mask] 不超过窑次上限的子集内，按「保留件数最多 →
+保留总体积最大 → 保留编号升序列表字典序最小」择优；选中器物的装窑
+仍调用 solve，沿用最少窑次与字典序排序。
 """
 
 from __future__ import annotations
@@ -46,21 +51,42 @@ class Kiln:
     firing_temp: int
 
 
-def solve(items: list[Ware], capacity: int) -> list[Kiln]:
-    """求最少窑次、字典序最小的装窑方案。
+@dataclass(frozen=True)
+class ProductionLimit:
+    """限窑次接单结果：保留/延期器物编号（升序）与保留器物的装窑明细。"""
 
-    器物编号按标准字符串字典序排列（如 "1" < "10" < "2"），
-    窑内编号升序、窑次间的整体字典序比较均以此为准。
+    kept_item_ids: tuple[str, ...]
+    delayed_item_ids: tuple[str, ...]
+    kilns: tuple[Kiln, ...]
 
-    :raises CapacityExceededError: 存在单件体积超过容量的器物。
-    :raises ValueError: 器物列表为空或超过 14 件。
-    """
 
-    n = len(items)
+@dataclass(frozen=True)
+class _Tables:
+    """子集枚举与位掩码 DP 的中间结果（位 i 对应编号升序后的第 i 件）。"""
+
+    n: int
+    ids: list[str]
+    mask_volume: list[int]
+    mask_temp_low: list[int]  # 交集下界（烧成温度）
+    valid: bytearray
+    dp: list[int]
+
+
+def _check_item_count(n: int) -> None:
     if n == 0:
         raise ValueError("至少需要一件器物")
     if n > 14:
         raise ValueError("器物数量不得超过 14 件")
+
+
+def _build_tables(items: list[Ware], capacity: int) -> _Tables:
+    """枚举 2^n 个子集，递推可成窑标记、子集总体积/温度交集与最少窑次 dp。
+
+    :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    """
+
+    n = len(items)
+    _check_item_count(n)
 
     # 器物按编号字典序升序排列；位 i 对应排序后的第 i 件。
     ordered = sorted(items, key=lambda it: it.item_id)
@@ -120,6 +146,28 @@ def solve(items: list[Ware], capacity: int) -> list[Kiln]:
             sub = (sub - 1) & mask
         dp[mask] = best
 
+    return _Tables(n, ids, mask_volume, mask_temp_low, valid, dp)
+
+
+def solve(items: list[Ware], capacity: int) -> list[Kiln]:
+    """求最少窑次、字典序最小的装窑方案。
+
+    器物编号按标准字符串字典序排列（如 "1" < "10" < "2"），
+    窑内编号升序、窑次间的整体字典序比较均以此为准。
+
+    :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    :raises ValueError: 器物列表为空或超过 14 件。
+    """
+
+    tables = _build_tables(items, capacity)
+    n = tables.n
+    ids = tables.ids
+    valid = tables.valid
+    dp = tables.dp
+    mask_volume = tables.mask_volume
+    mask_temp_low = tables.mask_temp_low
+    size = 1 << n
+
     # ---- 3. 贪心重建字典序最小方案 ----
     full = size - 1
     allowed_kilns = dp[full]
@@ -159,6 +207,81 @@ def solve(items: list[Ware], capacity: int) -> list[Kiln]:
         allowed_kilns -= 1
 
     return kilns
+
+
+def select_within_kiln_limit(
+    items: list[Ware], capacity: int, max_kilns: int
+) -> ProductionLimit:
+    """限窑次接单：在最多 max_kilns 窑内选择可烧器物。
+
+    使用给定单窑容量与各器物的体积、温度区间，枚举全部 2^n 个器物子集，
+    仅考虑最少窑次 ``dp[mask] ≤ max_kilns`` 的子集，按以下优先级择优：
+      1. 保留件数最多；
+      2. 保留器物总体积最大；
+      3. 仍并列时，保留编号升序列表（标准字符串字典序）最小。
+    选中后装窑完全复用 solve：实际窑次取保留器物的最少窑次
+    （可能少于 max_kilns），方案取整体字典序最小者。
+
+    :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    :raises ValueError: 器物列表为空/超过 14 件，或 max_kilns 小于 1。
+    """
+
+    n = len(items)
+    _check_item_count(n)
+    if max_kilns < 1:
+        raise ValueError("限窑次至少为 1")
+
+    tables = _build_tables(items, capacity)
+    size = 1 << n
+
+    # ---- 在可于 max_kilns 窑内装完的子集中择优 ----
+    best_mask = 0
+    best_count = 0
+    best_volume = 0
+    best_ids: tuple[str, ...] | None = None
+
+    for mask in range(1, size):
+        if tables.dp[mask] > max_kilns:
+            continue
+        count = mask.bit_count()
+        total = tables.mask_volume[mask]
+        if best_ids is not None and (
+            count < best_count
+            or (count == best_count and total < best_volume)
+        ):
+            continue
+        members = tuple(
+            tables.ids[i] for i in range(n) if (mask >> i) & 1
+        )
+        if (
+            best_ids is not None
+            and count == best_count
+            and total == best_volume
+            and members >= best_ids
+        ):
+            continue
+        best_mask = mask
+        best_count = count
+        best_volume = total
+        best_ids = members
+
+    # max_kilns >= 1，且 _build_tables 已排除单件超容器物，
+    # 每件器物均可单独成窑，至少能保留一件。
+    assert best_ids is not None and best_mask != 0
+
+    # ---- 保留器物的装窑沿用现有最少窑次与方案排序 ----
+    by_id = {it.item_id: it for it in items}
+    kept_wares = [by_id[i] for i in best_ids]
+    kilns = tuple(solve(kept_wares, capacity))
+
+    kept_set = set(best_ids)
+    delayed_ids = tuple(i for i in tables.ids if i not in kept_set)
+
+    return ProductionLimit(
+        kept_item_ids=best_ids,
+        delayed_item_ids=delayed_ids,
+        kilns=kilns,
+    )
 
 
 def min_capacity_for_target(

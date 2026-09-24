@@ -34,6 +34,14 @@ docker compose up --build -d
 2. 初始化 SQLite 数据库（建表，幂等）；
 3. 启动 Uvicorn 服务。
 
+启动后服务监听容器内 `8000` 端口，默认映射到宿主机 **`8000`**
+端口（可用环境变量 `KILN_API_PORT` 修改，见下文配置）：
+
+```bash
+$ curl -s http://localhost:8000/health
+{"status":"ok"}
+```
+
 停止：`docker compose down`（加 `-v` 可同时删除数据库卷）。
 
 ## 配置
@@ -162,6 +170,68 @@ curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/cap
 - `404` `PLAN_NOT_FOUND`：方案不存在；
 - `422`：请求参数非法（如 `target_kiln_count` 小于 1 或非整数）。
 
+### 4. 限窑次接单（在最多 max_kilns 窑内择优保留器物）
+
+`POST http://localhost:8000/plans/{id}/production-limit`
+
+针对**已保存**的方案，沿用其**单窑容量**以及每件器物的**体积与温度区间**，
+在**最多 `max_kilns` 窑**的产能约束下选择本批可烧（保留）的器物，
+其余器物延期。选择按以下优先级择优：
+
+1. **保留件数最多**；
+2. 件数相同则**保留器物总体积最大**；
+3. 仍并列时，取**保留编号升序列表字典序最小**者（标准字符串字典序）。
+
+保留器物的**实际装窑**完全复用创建方案的求解器：窑次取保留器物的
+**最少窑次**（可能少于 `max_kilns`），窑次相同时取整体字典序最小方案。
+**只读计算，不改写原方案。**
+
+请求体：
+
+```json
+{"max_kilns": 2}
+```
+
+字段约束：`max_kilns` 为整数，范围 `1～原方案器物数`。
+
+curl 示例：
+
+```bash
+curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/production-limit \
+  -H 'Content-Type: application/json' \
+  -d '{"max_kilns": 2}'
+```
+
+成功响应 `200 OK`（保留 / 延期编号均按编号升序，并附实际装窑明细）：
+
+```json
+{
+  "plan_id": "9c05e113e3e0430eb552a0bd01036dbb",
+  "max_kilns": 2,
+  "kept_count": 3,
+  "delayed_count": 1,
+  "kept_volume": 15,
+  "kept_item_ids": ["p1", "p2", "p3"],
+  "delayed_item_ids": ["p4"],
+  "kiln_count": 2,
+  "kilns": [
+    {"index": 1, "item_ids": ["p1"],       "total_volume": 5,  "firing_temp": 100},
+    {"index": 2, "item_ids": ["p2", "p3"], "total_volume": 10, "firing_temp": 150}
+  ]
+}
+```
+
+上例中 `p4` 温区（1000～1100）与其余器物无交集，2 窑内容纳不下 4 件，
+故延期；保留的 `p1 / p2 / p3` 以最少 2 窑烧成。
+注意 `kiln_count` 是保留器物的**实际**窑次——例如 `max_kilns` 传 2
+而保留器物 1 窑即可装下时，`kiln_count` 为 `1`。
+
+错误情况：
+
+- `400` `MAX_KILNS_OUT_OF_RANGE`：`max_kilns` 超出 `1～原方案器物数`；
+- `404` `PLAN_NOT_FOUND`：方案不存在；
+- `422`：请求参数非法（如 `max_kilns` 小于 1 或非整数）。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -192,6 +262,13 @@ n = 14 时子集总数 16 384，典型耗时在 1 秒以内。
 （容量放宽只会扩大可成窑子集集合），故在
 「最大单件体积 ～ 器物总体积」区间上**二分查找**最小可行容量，
 每个容量点完整调用上述求解器，搜索次数为区间长度的对数级。
+
+`production-limit` 接口的限窑次择优：直接复用步骤 1～2 得到的可行子集
+表与 `dp`（最少窑次），枚举全部 `2^n` 个器物子集，仅保留
+`dp[mask] ≤ max_kilns` 者，按「件数 → 总体积 → 编号升序列表字典序」
+三级键取最优；确定保留集合后再调用完整求解器生成装窑明细，
+故实际窑次取保留器物的最少窑次，方案排序与创建接口完全一致。
+n = 14 时与求解器同为万级枚举规模，典型耗时约 1～3 秒。
 
 ## 目录结构
 

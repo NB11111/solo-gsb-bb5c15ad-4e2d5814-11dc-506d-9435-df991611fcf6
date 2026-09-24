@@ -11,6 +11,7 @@ from app.solver import (  # noqa: E402
     TargetUnreachableError,
     Ware,
     min_capacity_for_target,
+    select_within_kiln_limit,
     solve,
 )
 
@@ -239,6 +240,165 @@ def test_min_capacity_matches_linear_scan():
             assert len(kilns) == counts[got_cap] <= target
             exp_kilns = solve(items, exp_cap)
             assert [k.item_ids for k in kilns] == [k.item_ids for k in exp_kilns]
+
+
+# ---------------------------------------------------------------------------
+# 限窑次接单 select_within_kiln_limit
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_production_limit(items, capacity, max_kilns):
+    """枚举全部 2^n 个子集，返回择优保留的编号元组（与接口相同的三级排序）。"""
+    ordered = sorted(items, key=lambda it: it.item_id)
+    by_id = {it.item_id: it for it in items}
+    best = None  # (件数, 总体积)，并列时取编号升序列表字典序最小者
+    for mask in range(1, 1 << len(ordered)):
+        members = tuple(it.item_id for j, it in enumerate(ordered) if (mask >> j) & 1)
+        if len(solve([by_id[i] for i in members], capacity)) > max_kilns:
+            continue
+        total = sum(by_id[i].volume for i in members)
+        if (
+            best is None
+            or (len(members), total) > (best[0], best[1])
+            or ((len(members), total) == (best[0], best[1]) and members < best[2])
+        ):
+            best = (len(members), total, members)
+    return best[2]
+
+
+def test_production_limit_basic_count():
+    # 每件 6、容量 10 -> 每窑至多 1 件；上限 2 窑 -> 保留 2 件，
+    # 件数与总体积均并列，取编号升序列表字典序最小者 ("1","2")。
+    items = [Ware(str(i), 6, 100, 200) for i in range(1, 4)]
+    result = select_within_kiln_limit(items, 10, 2)
+    assert result.kept_item_ids == ("1", "2")
+    assert result.delayed_item_ids == ("3",)
+    assert len(result.kilns) == 2
+    assert [k.item_ids for k in result.kilns] == [("1",), ("2",)]
+
+
+def test_production_limit_one_kiln():
+    # 温度互不兼容：1 与 2 不可同窑，1 窑内只能保留温度区间最大者。
+    items = [
+        Ware("1", 3, 100, 120),
+        Ware("2", 4, 130, 140),
+        Ware("3", 2, 110, 125),
+    ]
+    result = select_within_kiln_limit(items, 100, 1)
+    assert result.kept_item_ids == ("1", "3")
+    assert result.delayed_item_ids == ("2",)
+    assert len(result.kilns) == 1
+    assert result.kilns[0].item_ids == ("1", "3")
+    assert result.kilns[0].firing_temp == 110
+    assert result.kilns[0].total_volume == 5
+
+
+def test_production_limit_volume_tiebreak():
+    # 容量 10、上限 1 窑：体积 7/6/5 两两之和均超容，每件只能单独成窑，
+    # 件数同为 1 时保留总体积最大者 -> "1"(7)。
+    items = [
+        Ware("1", 7, 100, 200),
+        Ware("2", 6, 100, 200),
+        Ware("3", 5, 100, 200),
+    ]
+    result = select_within_kiln_limit(items, 10, 1)
+    assert result.kept_item_ids == ("1",)
+    assert result.delayed_item_ids == ("2", "3")
+
+
+def test_production_limit_id_tiebreak_standard_lex():
+    # 标准字符串字典序：("10",) < ("2",)，故上限 1 窑、件数与体积并列时
+    # 保留 "10" 而非 "2"。
+    items = [
+        Ware("2", 6, 100, 200),
+        Ware("10", 6, 100, 200),
+        Ware("3", 6, 100, 200),
+    ]
+    result = select_within_kiln_limit(items, 10, 1)
+    assert result.kept_item_ids == ("10",)
+    assert result.delayed_item_ids == ("2", "3")
+
+
+def test_production_limit_actual_kilns_may_be_fewer():
+    # 上限 3 窑但保留器物可全部装入 2 窑时，实际装窑取最少窑次。
+    items = [Ware(str(i), 6, 100, 200) for i in range(1, 4)]
+    result = select_within_kiln_limit(items, 10, 3)
+    assert result.kept_item_ids == ("1", "2", "3")
+    assert result.delayed_item_ids == ()
+    assert len(result.kilns) == 3
+
+    # 同样 3 件、容量 12（两两可同窑）、上限 3 窑 -> 全部保留且实际 2 窑
+    items = [Ware(str(i), 6, 100, 200) for i in range(1, 4)]
+    result = select_within_kiln_limit(items, 12, 3)
+    assert result.kept_item_ids == ("1", "2", "3")
+    assert len(result.kilns) == 2
+
+
+def test_production_limit_max_equals_item_count_keeps_all():
+    items = [
+        Ware("a", 3, 100, 120),
+        Ware("b", 5, 130, 140),
+    ]
+    result = select_within_kiln_limit(items, 100, 2)
+    assert result.kept_item_ids == ("a", "b")
+    assert result.delayed_item_ids == ()
+    assert len(result.kilns) == 2
+
+
+def test_production_limit_invalid_max_kilns():
+    items = [Ware("a", 5, 100, 200)]
+    try:
+        select_within_kiln_limit(items, 10, 0)
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass
+
+
+def test_production_limit_oversized_item_still_errors():
+    # 原方案保存时单件不会超容，此处保持 solver 语义一致：超容即报错。
+    items = [Ware("a", 11, 100, 200)]
+    try:
+        select_within_kiln_limit(items, 10, 1)
+        assert False, "应抛出 CapacityExceededError"
+    except CapacityExceededError:
+        pass
+
+
+def test_production_limit_random_brute_force():
+    # 随机小规模用例：保留集合与装窑明细同时交叉验证暴力枚举 / solve。
+    rng = random.Random(99)
+    for trial in range(300):
+        n = rng.randint(1, 7)
+        items = []
+        for i in range(n):
+            vol = rng.randint(1, 8)
+            lo = rng.randint(900, 1000)
+            hi = lo + rng.randint(0, 100)
+            items.append(Ware(f"id{i}", vol, lo, hi))
+        capacity = rng.randint(max(it.volume for it in items), 20)
+        max_kilns = rng.randint(1, n)
+
+        result = select_within_kiln_limit(items, capacity, max_kilns)
+        exp_kept = _brute_force_production_limit(items, capacity, max_kilns)
+        assert result.kept_item_ids == exp_kept, (
+            f"trial {trial}: kept {result.kept_item_ids} != {exp_kept}, "
+            f"items={items}, cap={capacity}, max_kilns={max_kilns}"
+        )
+        # 延期列表 = 全量编号 - 保留编号，均升序
+        all_ids = tuple(sorted(it.item_id for it in items))
+        kept_set = set(exp_kept)
+        assert result.delayed_item_ids == tuple(i for i in all_ids if i not in kept_set)
+        # 装窑明细与 solve 在保留子集上的结果一致（最少窑次 + 字典序）
+        by_id = {it.item_id: it for it in items}
+        exp_kilns = solve([by_id[i] for i in exp_kept], capacity)
+        assert len(exp_kilns) <= max_kilns
+        assert [k.item_ids for k in result.kilns] == [k.item_ids for k in exp_kilns]
+        assert [k.total_volume for k in result.kilns] == [
+            k.total_volume for k in exp_kilns
+        ]
+        assert [k.firing_temp for k in result.kilns] == [
+            k.firing_temp for k in exp_kilns
+        ]
 
 
 if __name__ == "__main__":
