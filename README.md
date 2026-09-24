@@ -162,6 +162,54 @@ curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/cap
 - `404` `PLAN_NOT_FOUND`：方案不存在；
 - `422`：请求参数非法（如 `target_kiln_count` 小于 1 或非整数）。
 
+### 4. 限窑次接单
+
+`POST http://localhost:8000/plans/{id}/production-limit`
+
+针对**已保存**的方案，以方案中保存的单窑容量、器物体积与温度区间为准，
+在**最多 `max_kilns` 窑**的限制内选择可烧器物：先最大化**保留件数**，
+再最大化**保留总体积**，仍并列时取**保留编号升序列表字典序最小**的结果；
+装窑沿用与创建方案相同的最少窑次与字典序排序规则。**只读计算，不改写原方案。**
+
+请求体：
+
+```json
+{"max_kilns": 2}
+```
+
+字段约束：`max_kilns` 为整数，范围 `1～原方案器物数`。
+
+curl 示例：
+
+```bash
+curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/production-limit \
+  -H 'Content-Type: application/json' \
+  -d '{"max_kilns": 2}'
+```
+
+成功响应 `200 OK`（保留 / 延期编号均升序，含实际装窑明细）：
+
+```json
+{
+  "plan_id": "9c05e113e3e0430eb552a0bd01036dbb",
+  "max_kilns": 2,
+  "kept_item_ids": ["p1", "p2", "p3"],
+  "deferred_item_ids": ["p4"],
+  "kept_total_volume": 15,
+  "kiln_count": 2,
+  "kilns": [
+    {"index": 1, "item_ids": ["p1"],       "total_volume": 5,  "firing_temp": 100},
+    {"index": 2, "item_ids": ["p2", "p3"], "total_volume": 10, "firing_temp": 150}
+  ]
+}
+```
+
+错误情况：
+
+- `400` `MAX_KILNS_OUT_OF_RANGE`：`max_kilns` 超出 `1～原方案器物数`；
+- `404` `PLAN_NOT_FOUND`：方案不存在；
+- `422`：请求参数非法（如 `max_kilns` 小于 1 或非整数）。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -192,6 +240,11 @@ n = 14 时子集总数 16 384，典型耗时在 1 秒以内。
 （容量放宽只会扩大可成窑子集集合），故在
 「最大单件体积 ～ 器物总体积」区间上**二分查找**最小可行容量，
 每个容量点完整调用上述求解器，搜索次数为区间长度的对数级。
+
+`production-limit` 接口的限窑次选品：复用同一张子集可行性表与最少窑次
+DP，遍历全部 `2^n` 个掩码，在 `dp[mask] ≤ max_kilns` 的子集中按
+「保留件数 → 保留总体积 → 保留编号升序列表字典序」取最优，
+再对选中子集执行第 3 步的字典序重建完成装窑。
 
 ## 目录结构
 

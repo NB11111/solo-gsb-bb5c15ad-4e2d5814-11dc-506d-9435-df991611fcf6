@@ -14,6 +14,10 @@
   3. 贪心重建字典序最小方案：每一步在剩余器物中，找到包含剩余器物
      最小编号、且取出后剩余部分仍可在剩余窑次内装完的、
      器物编号序列字典序最小的子集作为下一窑。
+
+限窑次接单（select_within_kiln_limit）：复用同一组子集 DP，在
+dp[mask] <= max_kilns 的子集中按「保留件数最多 → 保留总体积最大 →
+保留编号升序列表字典序最小」选出保留集合，再按步骤 3 装窑。
 """
 
 from __future__ import annotations
@@ -46,11 +50,17 @@ class Kiln:
     firing_temp: int
 
 
-def solve(items: list[Ware], capacity: int) -> list[Kiln]:
-    """求最少窑次、字典序最小的装窑方案。
+def _prepare(
+    items: list[Ware], capacity: int
+) -> tuple[list[str], bytearray, list[int], list[int], list[int]]:
+    """排序、校验并预计算子集可行性、总体积、烧成温度与最少窑次 DP。
 
-    器物编号按标准字符串字典序排列（如 "1" < "10" < "2"），
-    窑内编号升序、窑次间的整体字典序比较均以此为准。
+    器物按编号字典序升序排列，位 i 对应排序后的第 i 件。
+    返回 (ids, valid, mask_volume, mask_temp_low, dp)：
+      * valid[mask]       掩码对应子集能否同窑烧成；
+      * mask_volume[mask] 子集总体积；
+      * mask_temp_low[mask] 子集温度交集下界（即成窑时的烧成温度）；
+      * dp[mask]          烧完子集所需的最少窑次。
 
     :raises CapacityExceededError: 存在单件体积超过容量的器物。
     :raises ValueError: 器物列表为空或超过 14 件。
@@ -62,7 +72,6 @@ def solve(items: list[Ware], capacity: int) -> list[Kiln]:
     if n > 14:
         raise ValueError("器物数量不得超过 14 件")
 
-    # 器物按编号字典序升序排列；位 i 对应排序后的第 i 件。
     ordered = sorted(items, key=lambda it: it.item_id)
     ids = [it.item_id for it in ordered]
     volumes = [it.volume for it in ordered]
@@ -120,10 +129,26 @@ def solve(items: list[Ware], capacity: int) -> list[Kiln]:
             sub = (sub - 1) & mask
         dp[mask] = best
 
-    # ---- 3. 贪心重建字典序最小方案 ----
-    full = size - 1
-    allowed_kilns = dp[full]
-    left = full
+    return ids, valid, mask_volume, mask_temp_low, dp
+
+
+def _reconstruct(
+    ids: list[str],
+    valid: bytearray,
+    mask_volume: list[int],
+    mask_temp_low: list[int],
+    dp: list[int],
+    target: int,
+    allowed_kilns: int,
+) -> list[Kiln]:
+    """贪心重建字典序最小方案：将 target 掩码的器物装入 allowed_kilns 窑。
+
+    每一步在剩余器物中，找到包含剩余器物最小编号、且取出后剩余部分
+    仍可在剩余窑次内装完的、器物编号序列字典序最小的子集作为下一窑。
+    """
+
+    n = len(ids)
+    left = target
     kilns: list[Kiln] = []
 
     while left:
@@ -159,6 +184,70 @@ def solve(items: list[Ware], capacity: int) -> list[Kiln]:
         allowed_kilns -= 1
 
     return kilns
+
+
+def solve(items: list[Ware], capacity: int) -> list[Kiln]:
+    """求最少窑次、字典序最小的装窑方案。
+
+    器物编号按标准字符串字典序排列（如 "1" < "10" < "2"），
+    窑内编号升序、窑次间的整体字典序比较均以此为准。
+
+    :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    :raises ValueError: 器物列表为空或超过 14 件。
+    """
+
+    ids, valid, mask_volume, mask_temp_low, dp = _prepare(items, capacity)
+    full = (1 << len(ids)) - 1
+    return _reconstruct(ids, valid, mask_volume, mask_temp_low, dp, full, dp[full])
+
+
+def select_within_kiln_limit(
+    items: list[Ware], capacity: int, max_kilns: int
+) -> tuple[list[str], list[str], list[Kiln]]:
+    """在最多 max_kilns 窑内选择可烧器物并给出装窑方案。
+
+    子集 mask 可被选上当且仅当 dp[mask] <= max_kilns（最少窑次不超过限制）。
+    在可选子集中按以下优先级取最优：
+      1. 保留件数最多；
+      2. 保留总体积最大；
+      3. 保留编号升序列表字典序最小。
+    保留集合的装窑沿用 solve 的最少窑次与字典序方案排序。
+
+    :returns: (kept_ids, deferred_ids, kilns)，kept/deferred 均按编号升序。
+    :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    :raises ValueError: 器物列表为空或超过 14 件，或 max_kilns 小于 1。
+    """
+
+    if max_kilns < 1:
+        raise ValueError("最多窑次至少为 1")
+
+    ids, valid, mask_volume, mask_temp_low, dp = _prepare(items, capacity)
+    n = len(ids)
+
+    best_mask = 0
+    best_count = 0
+    best_volume = 0
+    best_tuple: tuple[str, ...] = ()
+    for mask in range(1 << n):
+        if dp[mask] > max_kilns:
+            continue
+        count = mask.bit_count()
+        volume = mask_volume[mask]
+        if (count, volume) < (best_count, best_volume):
+            continue
+        members = tuple(ids[i] for i in range(n) if (mask >> i) & 1)
+        if (count, volume) > (best_count, best_volume) or members < best_tuple:
+            best_mask = mask
+            best_count = count
+            best_volume = volume
+            best_tuple = members
+
+    kept_set = set(best_tuple)
+    deferred = [i for i in ids if i not in kept_set]
+    kilns = _reconstruct(
+        ids, valid, mask_volume, mask_temp_low, dp, best_mask, dp[best_mask]
+    )
+    return list(best_tuple), deferred, kilns
 
 
 def min_capacity_for_target(

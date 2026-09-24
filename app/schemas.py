@@ -96,3 +96,23 @@ class CapacityTargetOut(BaseModel):
     min_capacity: int = Field(..., description="使最少窑次不超过目标的最小单窑容量")
     kiln_count: int = Field(..., description="该容量下的实际窑次")
     kilns: list[KilnOut] = Field(..., description="该容量下的装窑明细")
+
+
+class ProductionLimitIn(BaseModel):
+    """限窑次接单请求。"""
+
+    max_kilns: int = Field(
+        ..., strict=True, ge=1, description="最多窑次（1～原方案器物数）"
+    )
+
+
+class ProductionLimitOut(BaseModel):
+    """限窑次接单结果（不改动原方案）。"""
+
+    plan_id: str = Field(..., description="原方案 ID")
+    max_kilns: int = Field(..., description="最多窑次")
+    kept_item_ids: list[str] = Field(..., description="保留（接单）器物编号，升序")
+    deferred_item_ids: list[str] = Field(..., description="延期器物编号，升序")
+    kept_total_volume: int = Field(..., description="保留器物总体积")
+    kiln_count: int = Field(..., description="实际窑次")
+    kilns: list[KilnOut] = Field(..., description="实际装窑明细")
